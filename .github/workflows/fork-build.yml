@@ -1,0 +1,117 @@
+name: Fork Build
+
+# Fork 專用：拿掉官方的 S3 deploy，改成 GitHub Artifacts + GitHub Release。
+# 使用方式：放到你 fork 的 .github/workflows/fork-build.yml，
+# 並把原來的 .github/workflows/build.yml 停用（改名或刪掉），
+# 否則原 workflow 會因為缺 AWS_ROLE_ARN / vars 在 deploy 卡住。
+on:
+  push:
+    branches: ["master"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build ${{ matrix.configuration }} / ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: Release
+            platform: Win32
+            runner: windows-2022
+            msbuild-architecture: x64
+            arch: x86
+
+          - configuration: Release
+            platform: x64
+            runner: windows-2022
+            msbuild-architecture: x64
+            arch: x64
+
+          # ARM64 需要 windows-11-arm runner，fork 沒有的話先註解掉。
+          # - configuration: Release
+          #   platform: ARM64
+          #   runner: windows-11-arm
+          #   msbuild-architecture: arm64
+          #   arch: arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: ${{ matrix.msbuild-architecture }}
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-${{ matrix.configuration }}-${{ matrix.platform }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-${{ matrix.configuration }}-${{ matrix.platform }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Bootstrap vcpkg
+        run: Explorer++/ThirdParty/vcpkg/bootstrap-vcpkg.bat
+
+      - name: Build
+        run: |
+          msbuild `
+            Explorer++/Explorer++.sln `
+            /p:Configuration=${{ matrix.configuration }} `
+            /p:Platform=${{ matrix.platform }} `
+            /p:ExplorerPlusPlusBuildVersion=${{ github.run_number }} `
+            /v:minimal
+
+      - name: Run tests
+        run: ./.github/run_tests.ps1 -Configuration '${{ matrix.configuration }}' -Platform '${{ matrix.platform }}'
+
+      - name: Package artifacts
+        run: ./.github/package.ps1 -Configuration '${{ matrix.configuration }}' -Platform '${{ matrix.platform }}'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Explorer++.${{ matrix.configuration }}.${{ matrix.platform }}
+          path: artifacts
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Release
+    needs: build
+    # 只有打 tag (git tag v1.5.0.xxx; git push origin v1.5.0.xxx) 才會發 Release。
+    # 平常 push master 只會留 Artifacts，不會發版。
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: deployment
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            deployment/**/*.zip
+            deployment/**/*.msi
+          generate_release_notes: true
